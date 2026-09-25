@@ -1,0 +1,711 @@
+// ============================================================
+// Key Sound - 现代扁平 GUI 版
+// 深色主题 + 自定义绘制开关 + 音量滑块 + 系统托盘
+// ============================================================
+
+#define _WIN32_WINNT 0x0A00
+
+#include <windows.h>
+#include <windowsx.h>       // GET_X_LPARAM / GET_Y_LPARAM
+#include <shellapi.h>
+#include <dwmapi.h>
+#include <gdiplus.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <cwchar>
+
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+
+using namespace Gdiplus;
+
+// ---------------- 常量 ----------------
+#define WINDOW_W        380
+#define WINDOW_H        500
+#define WM_TRAYICON     (WM_USER + 1)
+#define IDM_SHOW        1001
+#define IDM_TOGGLE      1002
+#define IDM_EXIT        1003
+#define ID_TIMER_ANIM   1
+
+// ---------------- 配色 ----------------
+static const Color C_BG          (255,  15,  15,  26);
+static const Color C_CARD        (255,  28,  28,  44);
+static const Color C_CARD_HOVER  (255,  38,  38,  58);
+static const Color C_ACCENT      (255, 124,  92, 255);
+static const Color C_ACCENT_HOVER(255, 148, 118, 255);
+static const Color C_TRACK_OFF   (255,  55,  55,  78);
+static const Color C_TRACK_HOVER (255,  72,  72,  98);
+static const Color C_TEXT        (255, 240, 240, 250);
+static const Color C_TEXT_DIM    (255, 148, 155, 175);
+static const Color C_BORDER      (255,  45,  45,  65);
+
+// ---------------- 全局状态 ----------------
+static ma_engine       g_engine;
+static ma_sound        g_sounds[128];
+static int             g_soundCount   = 0;
+static int             g_currentIndex = -1;
+static BOOL            g_pressedFlag[256] = { FALSE };
+static HWND            g_hwnd = NULL;
+static HHOOK           g_hook = NULL;
+static HINSTANCE       g_hInst = NULL;
+static NOTIFYICONDATAW g_nid = { 0 };
+
+static bool  g_enabled      = true;
+static float g_switchPos    = 1.0f;
+static float g_switchTarget = 1.0f;
+static float g_volume       = 0.8f;
+static bool  g_draggingVol  = false;
+
+static bool  g_hoverSwitch  = false;
+static bool  g_hoverButton  = false;
+
+static RECT  g_rcSwitch = { 0 };
+static RECT  g_rcCard   = { 0 };
+static RECT  g_rcSlider = { 0 };
+static RECT  g_rcButton = { 0 };
+
+// ============================================================
+//                   GDI+ 绘制辅助
+// ============================================================
+
+static void AddRoundRect(GraphicsPath* path, const RectF& rect, float radius)
+{
+    float d = radius * 2.0f;
+    if (d > rect.Width)  d = rect.Width;
+    if (d > rect.Height) d = rect.Height;
+
+    path->AddArc(rect.X,                    rect.Y,                    d, d, 180, 90);
+    path->AddArc(rect.X + rect.Width - d,   rect.Y,                    d, d, 270, 90);
+    path->AddArc(rect.X + rect.Width - d,   rect.Y + rect.Height - d,  d, d,   0, 90);
+    path->AddArc(rect.X,                    rect.Y + rect.Height - d,  d, d,  90, 90);
+    path->CloseFigure();
+}
+
+static void FillRoundRect(Graphics& g, const RectF& rect, float radius, const Color& color)
+{
+    GraphicsPath path;
+    AddRoundRect(&path, rect, radius);
+    SolidBrush brush(color);
+    g.FillPath(&brush, &path);
+}
+
+static void StrokeRoundRect(Graphics& g, const RectF& rect, float radius, const Color& color, float width)
+{
+    GraphicsPath path;
+    AddRoundRect(&path, rect, radius);
+    Pen pen(color, width);
+    g.DrawPath(&pen, &path);
+}
+
+static Color LerpColor(const Color& a, const Color& b, float t)
+{
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    BYTE r  = (BYTE)(a.GetR() + (int)((int)b.GetR()  - (int)a.GetR())  * t);
+    BYTE g  = (BYTE)(a.GetG() + (int)((int)b.GetG()  - (int)a.GetG())  * t);
+    BYTE bl = (BYTE)(a.GetB() + (int)((int)b.GetB()  - (int)a.GetB())  * t);
+    return Color(255, r, g, bl);
+}
+
+// ============================================================
+//                   音效相关
+// ============================================================
+
+static void GetExeDir(char* out, size_t outSize)
+{
+    GetModuleFileNameA(NULL, out, (DWORD)outSize);
+    char* last = strrchr(out, '\\');
+    if (last) *last = '\0';
+}
+
+static BOOL IsSupportedExt(const char* filename)
+{
+    const char* dot = NULL;
+    for (const char* p = filename; *p; ++p) if (*p == '.') dot = p;
+    if (!dot) return FALSE;
+
+    char ext[8] = { 0 };
+    int i = 0;
+    for (const char* p = dot; *p && i < 7; ++p, ++i)
+        ext[i] = (char)tolower((unsigned char)*p);
+
+    return strcmp(ext, ".wav")  == 0
+        || strcmp(ext, ".mp3")  == 0
+        || strcmp(ext, ".flac") == 0;
+}
+
+static int LoadSounds(const char* dir)
+{
+    char searchPath[MAX_PATH];
+    sprintf_s(searchPath, MAX_PATH, "%s\\*", dir);
+
+    WIN32_FIND_DATAA findData;
+    HANDLE hFind = FindFirstFileA(searchPath, &findData);
+    if (hFind == INVALID_HANDLE_VALUE) return 0;
+
+    int count = 0;
+    do {
+        if (findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (!IsSupportedExt(findData.cFileName)) continue;
+        if (count >= 128) break;
+
+        char fullPath[MAX_PATH];
+        sprintf_s(fullPath, MAX_PATH, "%s\\%s", dir, findData.cFileName);
+
+        ma_sound* snd = &g_sounds[count];
+        if (ma_sound_init_from_file(&g_engine, fullPath,
+                                    MA_SOUND_FLAG_DECODE,
+                                    NULL, NULL, snd) == MA_SUCCESS) {
+            count++;
+        }
+    } while (FindNextFileA(hFind, &findData));
+
+    FindClose(hFind);
+    return count;
+}
+
+static void PlayInterrupting(int index)
+{
+    if (index < 0 || index >= g_soundCount) return;
+
+    if (g_currentIndex >= 0 && g_currentIndex != index) {
+        ma_sound_stop(&g_sounds[g_currentIndex]);
+    }
+    ma_sound_stop(&g_sounds[index]);
+    ma_sound_seek_to_pcm_frame(&g_sounds[index], 0);
+    ma_sound_start(&g_sounds[index]);
+    g_currentIndex = index;
+}
+
+// ============================================================
+//                   键盘钩子
+// ============================================================
+
+static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    if (nCode == HC_ACTION && g_enabled) {
+        KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
+
+        if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+            if (p->vkCode < 256 && !g_pressedFlag[p->vkCode]) {
+                g_pressedFlag[p->vkCode] = TRUE;
+                if (g_soundCount > 0) {
+                    PlayInterrupting(rand() % g_soundCount);
+                }
+            }
+        }
+        else if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+            if (p->vkCode < 256) g_pressedFlag[p->vkCode] = FALSE;
+        }
+    }
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+// ============================================================
+//                   布局计算
+// ============================================================
+
+static void LayoutControls()
+{
+    g_rcCard.left   = 30;
+    g_rcCard.top    = 100;
+    g_rcCard.right  = WINDOW_W - 30;
+    g_rcCard.bottom = 265;
+
+    int sw = 80, sh = 42;
+    g_rcSwitch.left   = (WINDOW_W - sw) / 2;
+    g_rcSwitch.top    = 140;
+    g_rcSwitch.right  = g_rcSwitch.left + sw;
+    g_rcSwitch.bottom = g_rcSwitch.top + sh;
+
+    g_rcSlider.left   = 30;
+    g_rcSlider.right  = WINDOW_W - 30;
+    g_rcSlider.top    = 360;
+    g_rcSlider.bottom = 400;
+
+    g_rcButton.left   = 30;
+    g_rcButton.top    = 420;
+    g_rcButton.right  = WINDOW_W - 30;
+    g_rcButton.bottom = 464;
+}
+
+// ============================================================
+//                   界面绘制
+// ============================================================
+
+static void DrawUI(Graphics& g, int w, int h)
+{
+    // 背景
+    SolidBrush bgBrush(C_BG);
+    g.FillRectangle(&bgBrush, 0, 0, w, h);
+
+    // 标题圆点
+    {
+        SolidBrush dotBrush(C_ACCENT);
+        g.FillEllipse(&dotBrush, 30, 32, 10, 10);
+    }
+
+    // 标题
+    {
+        Font font(L"Microsoft YaHei UI", 22, FontStyleBold, UnitPixel);
+        SolidBrush brush(C_TEXT);
+        StringFormat sf;
+        sf.SetAlignment(StringAlignmentNear);
+        sf.SetLineAlignment(StringAlignmentCenter);
+        RectF rc(50, 22, 260, 30);
+        g.DrawString(L"Key Sound", -1, &font, rc, &sf, &brush);
+    }
+
+    // 副标题
+    {
+        Font font(L"Microsoft YaHei UI", 12, FontStyleRegular, UnitPixel);
+        SolidBrush brush(C_TEXT_DIM);
+        StringFormat sf;
+        RectF rc(30, 58, 300, 20);
+        g.DrawString(L"按键音效播放器", -1, &font, rc, &sf, &brush);
+    }
+
+    // 卡片
+    {
+        RectF cardRc((REAL)g_rcCard.left, (REAL)g_rcCard.top,
+                     (REAL)(g_rcCard.right - g_rcCard.left),
+                     (REAL)(g_rcCard.bottom - g_rcCard.top));
+        FillRoundRect(g, cardRc, 18.0f, C_CARD);
+    }
+
+    // 开关
+    {
+        REAL tx = (REAL)g_rcSwitch.left;
+        REAL ty = (REAL)g_rcSwitch.top;
+        REAL tw = (REAL)(g_rcSwitch.right - g_rcSwitch.left);
+        REAL th = (REAL)(g_rcSwitch.bottom - g_rcSwitch.top);
+
+        Color offColor   = g_hoverSwitch ? C_TRACK_HOVER  : C_TRACK_OFF;
+        Color onColor    = g_hoverSwitch ? C_ACCENT_HOVER : C_ACCENT;
+        Color trackColor = LerpColor(offColor, onColor, g_switchPos);
+
+        RectF trackRc(tx, ty, tw, th);
+        FillRoundRect(g, trackRc, th / 2.0f, trackColor);
+
+        REAL knobSize = th - 8.0f;
+        REAL knobX = tx + 4.0f + (tw - knobSize - 8.0f) * g_switchPos;
+        REAL knobY = ty + 4.0f;
+
+        SolidBrush knobBrush(Color(255, 255, 255, 255));
+        g.FillEllipse(&knobBrush, knobX, knobY, knobSize, knobSize);
+    }
+
+    // 状态文字
+    {
+        const wchar_t* txt = g_enabled ? L"已开启" : L"已关闭";
+        Color statusColor  = g_enabled ? C_ACCENT : C_TEXT_DIM;
+        Font font(L"Microsoft YaHei UI", 14, FontStyleBold, UnitPixel);
+        SolidBrush brush(statusColor);
+
+        StringFormat sf;
+        sf.SetAlignment(StringAlignmentCenter);
+        sf.SetLineAlignment(StringAlignmentCenter);
+
+        REAL cx = (REAL)((g_rcCard.left + g_rcCard.right) / 2);
+        RectF rc(cx - 100.0f, (REAL)(g_rcSwitch.bottom + 14), 200.0f, 26.0f);
+        g.DrawString(txt, -1, &font, rc, &sf, &brush);
+    }
+
+    // 音效数量
+    {
+        wchar_t buf[64];
+        swprintf_s(buf, L"已加载 %d 个音效", g_soundCount);
+
+        Font font(L"Microsoft YaHei UI", 13, FontStyleRegular, UnitPixel);
+        SolidBrush brush(C_TEXT_DIM);
+        StringFormat sf;
+        RectF rc(30, 290, 320, 24);
+        g.DrawString(buf, -1, &font, rc, &sf, &brush);
+    }
+
+    // 音量标签
+    {
+        Font font(L"Microsoft YaHei UI", 13, FontStyleRegular, UnitPixel);
+        SolidBrush textBrush(C_TEXT);
+        SolidBrush dimBrush(C_TEXT_DIM);
+        StringFormat sf;
+
+        RectF rcLabel(30, 326, 200, 24);
+        g.DrawString(L"音量", -1, &font, rcLabel, &sf, &textBrush);
+
+        wchar_t buf[16];
+        swprintf_s(buf, L"%d%%", (int)(g_volume * 100 + 0.5f));
+        sf.SetAlignment(StringAlignmentFar);
+        RectF rcVal(280, 326, 70, 24);
+        g.DrawString(buf, -1, &font, rcVal, &sf, &dimBrush);
+    }
+
+    // 音量滑块
+    {
+        REAL trackH = 8.0f;
+        REAL trackX = (REAL)g_rcSlider.left;
+        REAL trackW = (REAL)(g_rcSlider.right - g_rcSlider.left);
+        REAL trackY = (REAL)g_rcSlider.top +
+                      ((REAL)(g_rcSlider.bottom - g_rcSlider.top) - trackH) / 2.0f;
+
+        RectF bgTrack(trackX, trackY, trackW, trackH);
+        FillRoundRect(g, bgTrack, trackH / 2.0f, C_TRACK_OFF);
+
+        REAL filled = trackW * g_volume;
+        if (filled > 1.0f) {
+            RectF fillTrack(trackX, trackY, filled, trackH);
+            FillRoundRect(g, fillTrack, trackH / 2.0f, C_ACCENT);
+        }
+
+        REAL knobR  = 8.0f;
+        REAL knobCx = trackX + filled;
+        REAL knobCy = trackY + trackH / 2.0f;
+
+        SolidBrush knobBrush(Color(255, 255, 255, 255));
+        g.FillEllipse(&knobBrush, knobCx - knobR, knobCy - knobR, knobR * 2, knobR * 2);
+    }
+
+    // 按钮
+    {
+        REAL bx = (REAL)g_rcButton.left;
+        REAL by = (REAL)g_rcButton.top;
+        REAL bw = (REAL)(g_rcButton.right - g_rcButton.left);
+        REAL bh = (REAL)(g_rcButton.bottom - g_rcButton.top);
+
+        RectF btnRc(bx, by, bw, bh);
+        FillRoundRect(g, btnRc, 12.0f, g_hoverButton ? C_CARD_HOVER : C_CARD);
+        StrokeRoundRect(g, btnRc, 12.0f, C_BORDER, 1.0f);
+
+        Font font(L"Microsoft YaHei UI", 13, FontStyleRegular, UnitPixel);
+        SolidBrush brush(C_TEXT);
+        StringFormat sf;
+        sf.SetAlignment(StringAlignmentCenter);
+        sf.SetLineAlignment(StringAlignmentCenter);
+        g.DrawString(L"打开音效文件夹", -1, &font, btnRc, &sf, &brush);
+    }
+}
+
+// ============================================================
+//                   交互处理
+// ============================================================
+
+static void UpdateVolumeFromX(int x)
+{
+    REAL trackX = (REAL)g_rcSlider.left;
+    REAL trackW = (REAL)(g_rcSlider.right - g_rcSlider.left);
+    REAL v = (REAL)(x - trackX) / trackW;
+
+    if (v < 0.0f) v = 0.0f;
+    if (v > 1.0f) v = 1.0f;
+
+    g_volume = v;
+    ma_engine_set_volume(&g_engine, g_volume);
+    InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+static void OpenSoundsFolder()
+{
+    char exeDir[MAX_PATH];
+    GetExeDir(exeDir, MAX_PATH);
+
+    char soundsDir[MAX_PATH];
+    sprintf_s(soundsDir, MAX_PATH, "%s\\sounds", exeDir);
+
+    CreateDirectoryA(soundsDir, NULL);
+    ShellExecuteA(NULL, "open", soundsDir, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void ShowTrayMenu()
+{
+    POINT pt;
+    GetCursorPos(&pt);
+
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, IDM_SHOW, L"显示主窗口");
+    AppendMenuW(hMenu,
+                MF_STRING | (g_enabled ? MF_CHECKED : 0),
+                IDM_TOGGLE, L"启用音效");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, IDM_EXIT, L"退出");
+
+    SetForegroundWindow(g_hwnd);
+    TrackPopupMenu(hMenu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(hMenu);
+}
+
+// ============================================================
+//                   窗口过程
+// ============================================================
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        int w = rc.right;
+        int h = rc.bottom;
+
+        HDC     memDC  = CreateCompatibleDC(hdc);
+        HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
+        HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
+
+        {
+            Graphics g(memDC);
+            g.SetSmoothingMode(SmoothingModeAntiAlias);
+            g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+            DrawUI(g, w, h);
+        }
+
+        BitBlt(hdc, 0, 0, w, h, memDC, 0, 0, SRCCOPY);
+
+        SelectObject(memDC, oldBmp);
+        DeleteObject(memBmp);
+        DeleteDC(memDC);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN:
+    {
+        int x = GET_X_LPARAM(lParam);
+        int y = GET_Y_LPARAM(lParam);
+        POINT pt = { x, y };
+
+        if (PtInRect(&g_rcSwitch, pt)) {
+            g_enabled = !g_enabled;
+            g_switchTarget = g_enabled ? 1.0f : 0.0f;
+            SetTimer(hwnd, ID_TIMER_ANIM, 16, NULL);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        else if (PtInRect(&g_rcSlider, pt)) {
+            g_draggingVol = true;
+            SetCapture(hwnd);
+            UpdateVolumeFromX(x);
+        }
+        else if (PtInRect(&g_rcButton, pt)) {
+            OpenSoundsFolder();
+        }
+        return 0;
+    }
+
+    case WM_MOUSEMOVE:
+    {
+        if (g_draggingVol) {
+            UpdateVolumeFromX(GET_X_LPARAM(lParam));
+        }
+        else {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            bool hs = PtInRect(&g_rcSwitch, pt) != 0;
+            bool hb = PtInRect(&g_rcButton, pt) != 0;
+            if (hs != g_hoverSwitch || hb != g_hoverButton) {
+                g_hoverSwitch = hs;
+                g_hoverButton = hb;
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP:
+        if (g_draggingVol) {
+            g_draggingVol = false;
+            ReleaseCapture();
+        }
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == ID_TIMER_ANIM) {
+            float diff = g_switchTarget - g_switchPos;
+            if (fabsf(diff) < 0.01f) {
+                g_switchPos = g_switchTarget;
+                KillTimer(hwnd, ID_TIMER_ANIM);
+            } else {
+                g_switchPos += diff * 0.35f;
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_TRAYICON:
+        if (lParam == WM_LBUTTONUP) {
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+        }
+        else if (lParam == WM_RBUTTONUP) {
+            ShowTrayMenu();
+        }
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDM_SHOW:
+            ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
+            break;
+        case IDM_TOGGLE:
+            g_enabled = !g_enabled;
+            g_switchTarget = g_enabled ? 1.0f : 0.0f;
+            SetTimer(hwnd, ID_TIMER_ANIM, 16, NULL);
+            InvalidateRect(hwnd, NULL, FALSE);
+            break;
+        case IDM_EXIT:
+            DestroyWindow(hwnd);
+            break;
+        }
+        return 0;
+
+    case WM_CLOSE:
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+// ============================================================
+//                   入口函数
+// ============================================================
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
+{
+    // 单实例
+    HANDLE hMutex = CreateMutexW(NULL, TRUE, L"KeySound_SingleInstance_Mutex");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(NULL, L"程序已在运行，请查看系统托盘。",
+                    L"Key Sound", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+
+    g_hInst = hInstance;
+
+    // 初始化 GDI+
+    GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken = 0;
+    GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
+
+    // 初始化音频
+    ma_engine_config cfg = ma_engine_config_init();
+    cfg.periodSizeInFrames = 256;
+    if (ma_engine_init(&cfg, &g_engine) != MA_SUCCESS) {
+        MessageBoxW(NULL, L"音频引擎初始化失败。", L"Key Sound", MB_OK | MB_ICONERROR);
+        GdiplusShutdown(gdiplusToken);
+        return 1;
+    }
+    ma_engine_set_volume(&g_engine, g_volume);
+
+    // 加载音效
+    char exeDir[MAX_PATH];
+    GetExeDir(exeDir, MAX_PATH);
+
+    char soundsDir[MAX_PATH];
+    sprintf_s(soundsDir, MAX_PATH, "%s\\sounds", exeDir);
+    g_soundCount = LoadSounds(soundsDir);
+
+    // 布局
+    LayoutControls();
+
+    // 注册窗口类
+    WNDCLASSW wc = { 0 };
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInstance;
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = L"KeySoundMainWnd";
+    RegisterClassW(&wc);
+
+    // 创建窗口
+    int screenW = GetSystemMetrics(SM_CXSCREEN);
+    int screenH = GetSystemMetrics(SM_CYSCREEN);
+    int posX = (screenW - WINDOW_W) / 2;
+    int posY = (screenH - WINDOW_H) / 2;
+
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+
+    RECT rc = { 0, 0, WINDOW_W, WINDOW_H };
+    AdjustWindowRectEx(&rc, style, FALSE, 0);
+    int winW = rc.right - rc.left;
+    int winH = rc.bottom - rc.top;
+
+    g_hwnd = CreateWindowExW(
+        0,
+        L"KeySoundMainWnd",
+        L"Key Sound",
+        style,
+        posX, posY, winW, winH,
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (!g_hwnd) {
+        ma_engine_uninit(&g_engine);
+        GdiplusShutdown(gdiplusToken);
+        return 1;
+    }
+
+    // 暗色标题栏
+    {
+        BOOL useDark = TRUE;
+        DwmSetWindowAttribute(g_hwnd, 20, &useDark, sizeof(useDark));
+        DwmSetWindowAttribute(g_hwnd, 19, &useDark, sizeof(useDark));
+    }
+
+    ShowWindow(g_hwnd, SW_SHOW);
+    UpdateWindow(g_hwnd);
+
+    // 托盘图标
+    g_nid.cbSize           = sizeof(g_nid);
+    g_nid.hWnd             = g_hwnd;
+    g_nid.uID              = 1;
+    g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAYICON;
+    g_nid.hIcon            = LoadIconW(NULL, IDI_APPLICATION);
+    wcscpy_s(g_nid.szTip, _countof(g_nid.szTip), L"Key Sound - 按键音效");
+    Shell_NotifyIconW(NIM_ADD, &g_nid);
+
+    // 安装键盘钩子
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                               GetModuleHandleW(NULL), 0);
+
+    // 消息循环
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    // 清理
+    if (g_hook) UnhookWindowsHookEx(g_hook);
+    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+
+    for (int i = 0; i < g_soundCount; ++i)
+        ma_sound_uninit(&g_sounds[i]);
+
+    ma_engine_uninit(&g_engine);
+    GdiplusShutdown(gdiplusToken);
+
+    ReleaseMutex(hMutex);
+    CloseHandle(hMutex);
+    return 0;
+}
