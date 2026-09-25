@@ -1,6 +1,5 @@
 # wagaLauncher
-《明日方舟》艾丽妮的键盘音效播放器
-# wagaLauncher
+>《明日方舟》艾丽妮的键盘音效播放器
 
 > 一个轻量的键盘音效播放器 —— 按键即响，打断式播放，多套音效方案随心切换。
 
@@ -8,6 +7,7 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![C++](https://img.shields.io/badge/C%2B%2B-14-00599C)
+[![Downloads](https://img.shields.io/github/downloads/Cudny10D/wagaLauncher/total)](https://github.com/Cudny10D/wagaLauncher/releases)
 
 ---
 
@@ -81,14 +81,14 @@
 
 ### 安装步骤
 
-1. 从 [Releases](https://github.com/Cudny10D/wagaLauncher/releases) 下载最新的 `KeySound_Setup.exe`
+1. 从 [Releases](https://github.com/Cudny10D/wagaLauncher/releases) 下载最新的 `wagaLauncher_Setup.exe`
 2. 双击运行，按向导完成安装
 3. 安装时可勾选：
    - ☑ 创建桌面快捷方式
    - ☑ 创建开始菜单快捷方式
 4. 安装完成后可勾选"立即启动"
 
-默认安装位置：`C:\Program Files\Key Sound\`
+默认安装位置：`C:\Program Files\wagaLauncher\`
 
 ### 卸载
 
